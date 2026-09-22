@@ -780,7 +780,9 @@ start_server() {
     fi
 
     local exec_cmd
-    printf -v exec_cmd 'env AUTH_CONFIG=%q CONTROL_PORT=%q CONTROL_IP=%q /expressvpn/control-server.sh --handle' \
+    # Invoke through bash rather than relying on the execute bit: COPY preserves
+    # the repo's 644 mode, so an EXEC by path fails with status 126.
+    printf -v exec_cmd 'env AUTH_CONFIG=%q CONTROL_PORT=%q CONTROL_IP=%q bash /expressvpn/control-server.sh --handle' \
         "$AUTH_CONFIG" "$CONTROL_PORT" "$CONTROL_IP"
 
     local listen_addr="TCP-LISTEN:${CONTROL_PORT},reuseaddr,fork"

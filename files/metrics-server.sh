@@ -49,7 +49,8 @@ main() {
     fi
 
     local metrics
-    if ! metrics=$(/expressvpn/metrics.cgi 2>/dev/null | sed '1,2d'); then
+    # Run via bash: the shipped file is 644; only the www/ copy is chmod +x.
+    if ! metrics=$(bash /expressvpn/metrics.cgi 2>/dev/null | sed '1,2d'); then
         send_response "500 Internal Server Error" "text/plain" "failed to generate metrics"
         exit 0
     fi

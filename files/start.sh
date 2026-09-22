@@ -301,7 +301,8 @@ start_metrics_fallback() {
     local path="$2"
     local listen_addr="TCP-LISTEN:${port},reuseaddr,fork"
     local exec_cmd
-    printf -v exec_cmd 'env METRICS_EXPECTED_PATH=%q /expressvpn/metrics-server.sh' "$path"
+    # Invoke through bash: the file ships 644, so an EXEC by path exits 126.
+    printf -v exec_cmd 'env METRICS_EXPECTED_PATH=%q bash /expressvpn/metrics-server.sh' "$path"
     log "Starting metrics fallback server on port ${port} via socat"
     socat -T30 "${listen_addr}" EXEC:"${exec_cmd}",pipes >>/tmp/metrics-socat.log 2>&1 &
     local socat_pid=$!
@@ -363,8 +364,7 @@ start_control_server() {
     fi
 
     log "Starting ExpressVPN control server on ${CONTROL_IP:-0.0.0.0}:${CONTROL_PORT:-8000}"
-    chmod +x /expressvpn/control-server.sh 2>/dev/null || true
-    /expressvpn/control-server.sh &
+    bash /expressvpn/control-server.sh &
     allow_inbound_port "${CONTROL_PORT:-8000}"
 }
 
