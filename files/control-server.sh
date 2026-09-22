@@ -7,6 +7,13 @@ set -euo pipefail
 CONTROL_PORT="${CONTROL_PORT:-8000}"
 CONTROL_IP="${CONTROL_IP:-0.0.0.0}"
 AUTH_CONFIG="${AUTH_CONFIG:-/expressvpn/config.toml}"
+# Upper bound on a request body this server will read (bytes). Requests are
+# small JSON documents, so a modest cap keeps a bogus Content-Length from
+# making the handler sit and read.
+MAX_BODY_BYTES="${CONTROL_MAX_BODY_BYTES:-65536}"
+if [[ ! "$MAX_BODY_BYTES" =~ ^[0-9]+$ ]] || (( MAX_BODY_BYTES == 0 )); then
+    MAX_BODY_BYTES=65536
+fi
 
 declare -a ROLE_NAMES=()
 declare -a ROLE_AUTH_TYPES=()
@@ -84,6 +91,41 @@ set_region() {
     return 1
 }
 
+# Build a single role from the CONTROL_AUTH_* environment variables. Used when
+# no config file exists, and also when a config file exists but defines no
+# usable role - otherwise the "set CONTROL_AUTH_TYPE=none" advice the server
+# hands out on failure would have no effect for a mounted-but-empty config.
+load_env_role() {
+    local env_auth="${CONTROL_AUTH_TYPE:-}"
+    [[ -z "$env_auth" ]] && return 1
+
+    local routes_input="${CONTROL_AUTH_ROUTES:-*}"
+    local formatted_routes=""
+    IFS=',' read -ra route_parts <<< "$routes_input"
+    if (( ${#route_parts[@]} == 0 )); then
+        route_parts=('*')
+    fi
+    for route in "${route_parts[@]}"; do
+        route="${route#${route%%[![:space:]]*}}"
+        route="${route%${route##*[![:space:]]}}"
+        [[ -z "$route" ]] && continue
+        if [[ -n "$formatted_routes" ]]; then
+            formatted_routes+=$'\n'
+        fi
+        formatted_routes+="$route"
+    done
+    [[ -z "$formatted_routes" ]] && formatted_routes="*"
+
+    ROLE_NAMES+=("${CONTROL_AUTH_NAME:-env-role}")
+    ROLE_AUTH_TYPES+=("$env_auth")
+    ROLE_USERS+=("${CONTROL_AUTH_USER:-}")
+    ROLE_PASSWORDS+=("${CONTROL_AUTH_PASSWORD:-}")
+    ROLE_KEYS+=("${CONTROL_API_KEY:-}")
+    ROLE_ROUTES+=("$formatted_routes")
+    ROLE_COUNT=1
+    return 0
+}
+
 load_auth_config() {
     ROLE_NAMES=()
     ROLE_AUTH_TYPES=()
@@ -96,33 +138,7 @@ load_auth_config() {
     AUTH_CONFIG_ERROR=""
 
     if [[ ! -f "$AUTH_CONFIG" ]]; then
-        local env_auth="${CONTROL_AUTH_TYPE:-}"
-        if [[ -n "$env_auth" ]]; then
-            local routes_input="${CONTROL_AUTH_ROUTES:-*}"
-            local formatted_routes=""
-            IFS=',' read -ra route_parts <<< "$routes_input"
-            if (( ${#route_parts[@]} == 0 )); then
-                route_parts=('*')
-            fi
-            for route in "${route_parts[@]}"; do
-                route="${route#${route%%[![:space:]]*}}"
-                route="${route%${route##*[![:space:]]}}"
-                [[ -z "$route" ]] && continue
-                if [[ -n "$formatted_routes" ]]; then
-                    formatted_routes+=$'\n'
-                fi
-                formatted_routes+="$route"
-            done
-            [[ -z "$formatted_routes" ]] && formatted_routes="*"
-
-            ROLE_NAMES+=("${CONTROL_AUTH_NAME:-env-role}")
-            ROLE_AUTH_TYPES+=("$env_auth")
-            ROLE_USERS+=("${CONTROL_AUTH_USER:-}")
-            ROLE_PASSWORDS+=("${CONTROL_AUTH_PASSWORD:-}")
-            ROLE_KEYS+=("${CONTROL_API_KEY:-}")
-            ROLE_ROUTES+=("$formatted_routes")
-            ROLE_COUNT=1
-        fi
+        load_env_role || true
         return
     fi
 
@@ -167,6 +183,11 @@ PY
     fi
 
     while IFS=$'\x1e' read -r name auth username password api_key routes_line; do
+        # A here-string always yields one line, so an empty parse (a config with
+        # no roles) would otherwise register a single all-blank role, making the
+        # server demand credentials that can never match instead of reporting
+        # that nothing is configured.
+        [[ -z "$name$auth$username$password$api_key$routes_line" ]] && continue
         ROLE_NAMES+=("$name")
         ROLE_AUTH_TYPES+=("$auth")
         ROLE_USERS+=("$username")
@@ -176,6 +197,10 @@ PY
     done <<< "$parse_output"
 
     ROLE_COUNT=${#ROLE_NAMES[@]}
+
+    if (( ROLE_COUNT == 0 )); then
+        load_env_role || true
+    fi
 }
 
 role_allows_route() {
@@ -237,7 +262,15 @@ check_auth() {
     fi
 
     if [[ "$ROLE_COUNT" -eq 0 ]]; then
-        return 0
+        # Fail closed. With no roles defined nobody can be authenticated, and
+        # this API can connect/disconnect the VPN, so an unconfigured server
+        # must not serve anonymous requests just because it binds 0.0.0.0.
+        # Anonymous access stays available, but only when asked for explicitly
+        # (CONTROL_AUTH_TYPE=none, or a role with auth = "none").
+        AUTH_FAILURE_STATUS="503 Service Unavailable"
+        AUTH_FAILURE_MESSAGE="Control server has no authentication configured; mount an auth config at ${AUTH_CONFIG} or set CONTROL_AUTH_TYPE=none to allow anonymous access"
+        AUTH_FAILURE_HEADER=""
+        return 1
     fi
 
     local header_value route_allowed=false failure_header=""
@@ -416,7 +449,7 @@ run_dns_leak_test() {
 
 run_cloudflare_speed_test() {
     local timeout_secs="${CLOUDFLARE_SPEED_TIMEOUT:-120}"
-    local output json_output
+    local output
 
     if ! command -v cloudflare-speed-cli >/dev/null 2>&1; then
         jq -n --arg error "cloudflare-speed-cli not installed" '{error: $error}'
@@ -496,7 +529,13 @@ get_vpn_settings() {
           '{protocol: $protocol, region: $region, allow_lan: $allowlan}'
 }
 
-UPDATE_STATUS_CODE="200 OK"
+# update_vpn_settings runs inside a command substitution, which is a subshell,
+# so a status assigned to a global here never reaches the caller (every failure
+# was being returned as 200 OK). Emit the status as the first line of stdout
+# and let the caller split it off.
+emit_update() {
+    printf '%s\n%s' "$1" "$2"
+}
 
 update_vpn_settings() {
     local body="$1"
@@ -504,11 +543,8 @@ update_vpn_settings() {
     local errors=()
     local applied=()
 
-    UPDATE_STATUS_CODE="200 OK"
-
     if [[ -z "$body" ]]; then
-        UPDATE_STATUS_CODE="400 Bad Request"
-        jq -n --arg error "Missing JSON body" '{success: false, error: $error}'
+        emit_update "400 Bad Request" "$(jq -n --arg error "Missing JSON body" '{success: false, error: $error}')"
         return
     fi
 
@@ -517,8 +553,7 @@ update_vpn_settings() {
     allow_lan=$(printf '%s' "$body" | jq -r '.allow_lan // empty' 2>/dev/null || printf '')
 
     if [[ -z "$protocol" && -z "$region" && -z "$allow_lan" ]]; then
-        UPDATE_STATUS_CODE="400 Bad Request"
-        jq -n --arg error "No supported settings provided" '{success: false, error: $error}'
+        emit_update "400 Bad Request" "$(jq -n --arg error "No supported settings provided" '{success: false, error: $error}')"
         return
     fi
 
@@ -527,8 +562,7 @@ update_vpn_settings() {
         case "$protocol" in
             auto|lightwayudp|lightwaytcp|openvpnudp|openvpntcp|wireguard) ;;
             *)
-                UPDATE_STATUS_CODE="400 Bad Request"
-                jq -n --arg error "Unsupported protocol: ${protocol}" '{success: false, error: $error}'
+                emit_update "400 Bad Request" "$(jq -n --arg error "Unsupported protocol: ${protocol}" '{success: false, error: $error}')"
                 return
                 ;;
         esac
@@ -552,8 +586,7 @@ update_vpn_settings() {
     if [[ -n "$allow_lan" ]]; then
         allow_lan="${allow_lan,,}"
         if [[ "$allow_lan" != "true" && "$allow_lan" != "false" ]]; then
-            UPDATE_STATUS_CODE="400 Bad Request"
-            jq -n --arg error "allow_lan must be true or false" '{success: false, error: $error}'
+            emit_update "400 Bad Request" "$(jq -n --arg error "allow_lan must be true or false" '{success: false, error: $error}')"
             return
         fi
         if expressvpnctl set allowlan "$allow_lan" >/dev/null 2>&1; then
@@ -568,14 +601,13 @@ update_vpn_settings() {
     applied_json=$(printf '%s\n' "${applied[@]}" | jq -R -s 'split("\n") | map(select(length>0))')
 
     if ((${#errors[@]} > 0)); then
-        UPDATE_STATUS_CODE="500 Internal Server Error"
-        jq -n --argjson errors "$errors_json" --argjson applied "$applied_json" \
-            '{success: false, errors: $errors, applied: $applied}'
+        emit_update "500 Internal Server Error" "$(jq -n --argjson errors "$errors_json" --argjson applied "$applied_json" \
+            '{success: false, errors: $errors, applied: $applied}')"
         return
     fi
 
-    jq -n --argjson applied "$applied_json" --arg region "$region" \
-        '{success: true, applied: $applied, region: $region}'
+    emit_update "200 OK" "$(jq -n --argjson applied "$applied_json" --arg region "$region" \
+        '{success: true, applied: $applied, region: $region}')"
 }
 
 get_public_ip_short() {
@@ -625,9 +657,11 @@ handle_http_request() {
             http_response "200 OK" "application/json" "$(get_vpn_settings)"
             ;;
         "POST /v1/vpn/settings")
-            local update_body
-            update_body=$(update_vpn_settings "$body")
-            http_response "${UPDATE_STATUS_CODE}" "application/json" "$update_body"
+            local update_out update_status update_body
+            update_out=$(update_vpn_settings "$body")
+            update_status="${update_out%%$'\n'*}"
+            update_body="${update_out#*$'\n'}"
+            http_response "$update_status" "application/json" "$update_body"
             ;;
         "GET /v1/ip")
             http_response "200 OK" "application/json" "$(get_public_ip)"
@@ -676,7 +710,7 @@ handle_http_request() {
 }
 
 handle_connection() {
-    local request_line method path version header_line auth_header="" api_key_header="" content_length=0 body=""
+    local request_line method path header_line auth_header="" api_key_header="" content_length=0 body=""
 
     if ! IFS= read -r request_line; then
         return
@@ -684,7 +718,7 @@ handle_connection() {
     request_line=${request_line%$'\r'}
     log "Incoming request: $request_line"
 
-    IFS=' ' read -r method path version <<< "$request_line"
+    IFS=' ' read -r method path _ <<< "$request_line"
 
     while IFS= read -r header_line; do
         header_line=${header_line%$'\r'}
@@ -702,10 +736,31 @@ handle_connection() {
         esac
     done
 
-    content_length=${content_length:-0}
+    # Content-Length is attacker-controlled. Validate it as a plain integer
+    # *before* it ever reaches an arithmetic context: bash evaluates array
+    # subscripts inside (( )), so a non-numeric value there is an unsafe
+    # expansion, and under `set -u` it also kills this handler and drops the
+    # connection with no response at all.
+    content_length="$(trim "${content_length:-0}")"   # RFC 9110 allows OWS around field values
+    if [[ ! "$content_length" =~ ^[0-9]+$ ]]; then
+        local error_body
+        error_body=$(jq -n --arg error "Invalid Content-Length header" '{error: $error}')
+        http_response "400 Bad Request" "application/json" "$error_body"
+        return
+    fi
+    content_length=$((10#${content_length}))
+
+    if (( content_length > MAX_BODY_BYTES )); then
+        local error_body
+        error_body=$(jq -n --arg error "Request body too large" \
+                           --argjson limit "$MAX_BODY_BYTES" \
+                           '{error: $error, limit_bytes: $limit}')
+        http_response "413 Payload Too Large" "application/json" "$error_body"
+        return
+    fi
 
     if (( content_length > 0 )); then
-        body=$(dd bs=1 count="$content_length" 2>/dev/null || printf '')
+        body=$(head -c "$content_length" 2>/dev/null || printf '')
     fi
 
     local response
@@ -715,6 +770,14 @@ handle_connection() {
 
 start_server() {
     log "Starting ExpressVPN control server on $CONTROL_IP:$CONTROL_PORT"
+
+    load_auth_config
+    if [[ -n "${AUTH_CONFIG_ERROR:-}" ]]; then
+        log "WARNING: auth config at ${AUTH_CONFIG} failed to parse; all requests will be rejected until it is fixed."
+    elif [[ "$ROLE_COUNT" -eq 0 ]]; then
+        log "WARNING: no authentication configured (no roles at ${AUTH_CONFIG}, no CONTROL_AUTH_TYPE)."
+        log "WARNING: requests will be rejected with 503. Mount an auth config, or set CONTROL_AUTH_TYPE=none for anonymous access."
+    fi
 
     local exec_cmd
     printf -v exec_cmd 'env AUTH_CONFIG=%q CONTROL_PORT=%q CONTROL_IP=%q /expressvpn/control-server.sh --handle' \

@@ -1,0 +1,210 @@
+name: Build and push image
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      expressvpn_version:
+        description: "Full ExpressVPN build number (e.g. 14.2.1.NNNNN). Leave empty to use expressvpn.env."
+        required: false
+        type: string
+      expressvpn_sha256:
+        description: "SHA256 of the .run installer. Leave empty to use expressvpn.env (only valid when version is unchanged)."
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Resolve the ExpressVPN version/checksum once so every arch builds the same pin.
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      sha256: ${{ steps.resolve.outputs.sha256 }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: image
+        # GHCR rejects uppercase path components, and github.repository keeps the
+        # owner's original casing, so lowercase it once and reuse everywhere.
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "image=${REGISTRY}/${REPO,,}" >>"$GITHUB_OUTPUT"
+          echo "Image: ${REGISTRY}/${REPO,,}"
+
+      - name: Check Dockerfile defaults match expressvpn.env
+        # A plain `docker build .` uses only the Dockerfile ARG defaults, so the
+        # two must not drift apart silently.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./expressvpn.env
+          df_version="$(sed -n 's/^ARG EXPRESSVPN_VERSION="\(.*\)"$/\1/p' Dockerfile)"
+          df_sha256="$(sed -n 's/^ARG EXPRESSVPN_SHA256="\(.*\)"$/\1/p' Dockerfile)"
+          status=0
+          if [ "$df_version" != "$EXPRESSVPN_VERSION" ]; then
+            echo "::error::Dockerfile EXPRESSVPN_VERSION ($df_version) != expressvpn.env ($EXPRESSVPN_VERSION)"
+            status=1
+          fi
+          if [ "$df_sha256" != "$EXPRESSVPN_SHA256" ]; then
+            echo "::error::Dockerfile EXPRESSVPN_SHA256 ($df_sha256) != expressvpn.env ($EXPRESSVPN_SHA256)"
+            status=1
+          fi
+          exit "$status"
+
+      - name: Resolve version and checksum
+        id: resolve
+        # Inputs come in via env (never interpolated into the script body) to
+        # avoid shell injection from workflow_dispatch values.
+        env:
+          IN_VERSION: ${{ inputs.expressvpn_version }}
+          IN_SHA256: ${{ inputs.expressvpn_sha256 }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./expressvpn.env
+          version="${IN_VERSION:-$EXPRESSVPN_VERSION}"
+          # A checksum only makes sense for the matching version; if the caller
+          # supplied a new version without a checksum, fail loudly rather than
+          # verifying against the wrong hash.
+          if [ -n "${IN_VERSION:-}" ] && [ -z "${IN_SHA256:-}" ]; then
+            echo "::error::A new expressvpn_version was given without expressvpn_sha256. Provide the .run SHA256 too."
+            exit 1
+          fi
+          sha256="${IN_SHA256:-$EXPRESSVPN_SHA256}"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >>"$GITHUB_OUTPUT"
+          echo "Building ExpressVPN $version"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare platform slug
+        run: echo "PLATFORM_PAIR=${platform//\//-}" >>"$GITHUB_ENV"
+        env:
+          platform: ${{ matrix.platform }}
+
+      - name: Docker metadata (labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Skip pushing on pull_request (no write access / not wanted).
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            EXPRESSVPN_VERSION=${{ needs.prepare.outputs.version }}
+            EXPRESSVPN_SHA256=${{ needs.prepare.outputs.sha256 }}
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+          outputs: >-
+            type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=ref,event=tag
+            type=sha,format=short
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect image
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"

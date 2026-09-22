@@ -31,7 +31,8 @@ Container based on [polkaned/expressvpn](https://github.com/polkaned/dockerfiles
 - SOCKS5 proxy (microsocks) with auth and whitelist support.
 - Prometheus metrics exporter with `/metrics` or custom `.cgi` path.
 - Optional control server API to query status and control connections.
-- Healthcheck with optional DDNS/IP validation and healthchecks.io support.
+- Healthcheck that probes real external reachability through the tunnel, with
+  optional DDNS/IP leak validation and healthchecks.io support.
 - DNS whitelist for custom resolvers.
 - Built on `debian:trixie-slim` (amd64) with updated system packages.
 
@@ -56,7 +57,7 @@ docker run \
   --env=METRICS_PROMETHEUS=on \
   --env=CONTROL_SERVER=on \
   --env=SOCKS=off \
-  misioslav/expressvpn \
+  ghcr.io/kingroyal78/expressvpn \
   /bin/bash
 ```
 
@@ -82,7 +83,7 @@ services:
         condition: service_healthy
 
   expressvpn:
-    image: misioslav/expressvpn:latest
+    image: ghcr.io/kingroyal78/expressvpn:latest
     container_name: expressvpn
     restart: unless-stopped
     ports:
@@ -132,10 +133,12 @@ Environment variables (defaults shown):
 | ALLOW_LAN | Allow LAN access while Network Lock is on | true |
 | LAN_CIDR | Comma-separated LAN CIDRs for return routes | (empty) |
 | WHITELIST_DNS | Comma-separated DNS servers to allow via iptables | (empty) |
-| DDNS | Domain to compare with ExpressVPN public IP for healthcheck | (empty) |
-| IP | Static IP to compare with ExpressVPN public IP for healthcheck | (empty) |
-| BEARER | ipinfo.io bearer token (healthcheck and `/v1/ip`) | (empty) |
+| DDNS | Domain whose IPv4 must not equal the public IP (see [Healthcheck](#healthcheck)) | (empty) |
+| IP | Static IP that must not equal the public IP | (empty) |
+| BEARER | ipinfo.io bearer token (leak check and `/v1/ip`) | (empty) |
 | HEALTHCHECK | healthchecks.io UUID | (empty) |
+| HEALTHCHECK_URLS | Space-separated external probe URLs | Cloudflare + gstatic `generate_204` |
+| HEALTHCHECK_TIMEOUT | Per-probe timeout in seconds | 5 |
 | METRICS_PROMETHEUS | Enable metrics exporter (`on`/`off`) | off |
 | METRICS_PORT | Metrics port | 9797 |
 | METRICS_PATH | Metrics path (absolute, ends with `.cgi`) | /metrics.cgi |
@@ -143,6 +146,7 @@ Environment variables (defaults shown):
 | CONTROL_IP | Control server bind IP | 0.0.0.0 |
 | CONTROL_PORT | Control server port | 8000 |
 | AUTH_CONFIG | Auth config file path | /expressvpn/config.toml |
+| CONTROL_MAX_BODY_BYTES | Max control server request body size | 65536 |
 | CLOUDFLARE_SPEED_TIMEOUT | Speed test timeout in seconds (control server) | 120 |
 | SOCKS | Enable SOCKS5 proxy (`on`/`off`) | off |
 | SOCKS_IP | SOCKS bind IP | 0.0.0.0 |
@@ -248,6 +252,19 @@ If the config file is missing, a single role can be defined via environment vari
 - `CONTROL_API_KEY`
 - `CONTROL_AUTH_ROUTES` (comma-separated `METHOD /path`, default `*`)
 
+> **The control server fails closed.** If no roles are configured — no auth
+> config file *and* no `CONTROL_AUTH_TYPE` — every request is rejected with
+> `503 Service Unavailable`, and a warning is logged at startup. This API can
+> connect and disconnect the VPN, and it binds `0.0.0.0` by default, so an
+> unconfigured server must not answer anonymous callers.
+>
+> To allow anonymous access deliberately, set `CONTROL_AUTH_TYPE=none` (or give
+> a role `auth = "none"`). Earlier versions allowed anonymous access implicitly
+> whenever auth was unconfigured; if you relied on that, set this explicitly.
+
+Request bodies are capped at `CONTROL_MAX_BODY_BYTES` (default 65536). A
+malformed `Content-Length` is answered with `400`, an oversized one with `413`.
+
 Example request:
 
 ```bash
@@ -339,13 +356,56 @@ Import it in Grafana and select your Prometheus datasource to view all exported 
 
 ## Healthcheck
 
-The container healthcheck runs every 2 minutes.
+The container healthcheck runs every 30s. Five consecutive failures mark the
+container unhealthy, so a dead tunnel surfaces in ~2.5 minutes while a normal
+supervisor reconnect does not cause flapping. The 300s start period covers
+`start.sh`'s worst-case boot (daemon wait + activation + first connect).
 
-- Set `DDNS` or `IP` to compare against the ExpressVPN public IP.
-- Optional `BEARER` (ipinfo.io token) improves reliability.
-- Optional `HEALTHCHECK` posts status to healthchecks.io.
+It checks, cheapest first:
 
-If `DDNS` or `IP` are not set, the healthcheck is always healthy.
+1. The supervision loop's failure flag.
+2. The client's own connection state (fast-fail only).
+3. **External reachability** - an HTTP probe that must succeed *through the
+   tunnel*. This is the real check: ExpressVPN can report `Connected` with
+   `tun0` present while no traffic actually passes, which a local-only check
+   cannot detect.
+4. Optional public-IP leak check, when `DDNS` or `IP` is set.
+
+The healthcheck only observes. Reconnecting is the supervision loop's job, so
+the healthcheck never disconnects or reconnects the VPN itself.
+
+| ENV | Description | Default |
+| :--- | :--- | :---: |
+| HEALTHCHECK_URLS | Space-separated probe URLs; the first success wins | `https://cp.cloudflare.com/generate_204 https://connectivitycheck.gstatic.com/generate_204` |
+| HEALTHCHECK_TIMEOUT | Per-probe timeout in seconds | 5 |
+| HEALTHCHECK_DNS_TIMEOUT | Timeout for resolving `DDNS` | 5 |
+| HEALTHCHECK_VPN_IF | VPN interface to bind probes to (auto-detected otherwise) | (auto) |
+| DDNS | Domain whose IPv4 must **not** equal the public IP | (empty) |
+| IP | Static IP that must **not** equal the public IP | (empty) |
+| BEARER | ipinfo.io token for the leak check | (empty) |
+| HEALTHCHECK | healthchecks.io UUID to post status to | (empty) |
+
+Notes:
+
+- The probe is bound to the VPN interface (`--interface`), so it fails when the
+  tunnel is down even if the container could still reach the internet over its
+  default route — for example with `NETWORK=off`, where no network lock blocks
+  the leak. Interface detection covers `tun*`/`wg*`; override with
+  `HEALTHCHECK_VPN_IF`.
+- `DDNS` is compared within one address family: an A record against the public
+  IPv4, or an AAAA-only name against the public IPv6. Comparing across families
+  can never match and would silently disable the check.
+- If the public-IP lookup itself is unreachable, the leak check is skipped with
+  a warning instead of failing: reachability already proved the tunnel is alive,
+  and a third-party outage should not take the container down.
+- A detected leak cannot be fixed by the healthcheck (it only observes), and the
+  supervision loop cannot see it either, since the client still reports
+  `Connected`. The healthcheck therefore writes
+  `/tmp/expressvpn/reconnect-request.flag`, which the supervision loop picks up
+  and acts on by rebuilding the tunnel.
+- Raising `HEALTHCHECK_TIMEOUT` or adding probe URLs increases the worst-case
+  runtime, which must stay under the image's baked-in 30s healthcheck timeout;
+  beyond that, pass `--health-timeout` at run time.
 
 ## DNS Leak Check
 
@@ -389,12 +449,49 @@ Install `tunctl` if it is not present (`dnf install tunctl` or the `usermode-too
 
 ## Building
 
+The pinned ExpressVPN client version and its installer SHA256 live in
+[`expressvpn.env`](expressvpn.env) as the single source of truth. The universal
+`.run` installer is multi-arch (it bundles `amd64` and `arm64` binaries and
+picks one at install time), so the same download builds every platform.
+
+### Locally
+
 ```bash
-./expressbuild.sh 5.0.1.11498 test-repo
+# Single-arch (host arch), loads into the local docker:
+./expressbuild.sh <repository> [tag]
+
+# Multi-arch build + push to a registry:
+./expressbuild.sh <repository> [tag] --platform linux/amd64,linux/arm64 --push
 ```
+
+Supported platforms: `linux/amd64` and `linux/arm64` (there is no armhf/armv7
+build). `expressbuild.sh` reads the version and checksum from `expressvpn.env`.
+
+### CI (GitHub Actions)
+
+- **[`build.yml`](.github/workflows/build.yml)** builds `linux/amd64` (on
+  `ubuntu-24.04`) and `linux/arm64` (on native `ubuntu-24.04-arm` runners) in
+  parallel and pushes a combined multi-arch manifest to GHCR
+  (`ghcr.io/kingroyal78/expressvpn`). It runs on pushes to `master`, on `v*` tags, and
+  via **Run workflow**, where you can override the ExpressVPN version + SHA256.
+- **[`check-version.yml`](.github/workflows/check-version.yml)** runs daily and
+  opens an issue when a newer Linux client is published.
+
+### Bumping the ExpressVPN version
+
+The full build number in the download URL (e.g. `14.2.0.13656`) is only shown
+after signing in to **My Account → Set Up ExpressVPN → Linux**, so bumps are
+manual:
+
+1. Grab the full build number and download its
+   `expressvpn-linux-universal-<build>_release.run`.
+2. `sha256sum` that file.
+3. Update `EXPRESSVPN_VERSION` and `EXPRESSVPN_SHA256` in `expressvpn.env`
+   (and the matching `ARG` defaults in the `Dockerfile`), commit, and push —
+   or trigger **Build and push image** manually with both values as inputs.
 
 ## Download
 
 ```bash
-docker pull misioslav/expressvpn
+docker pull ghcr.io/kingroyal78/expressvpn:latest
 ```

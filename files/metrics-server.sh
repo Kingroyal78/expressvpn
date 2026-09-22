@@ -27,10 +27,10 @@ send_response() {
 }
 
 main() {
-    local request_line method path version header
+    local request_line method path header
 
     request_line=$(read_request_line) || exit 0
-    IFS=' ' read -r method path version <<< "${request_line:-GET / HTTP/1.1}"
+    IFS=' ' read -r method path _ <<< "${request_line:-GET / HTTP/1.1}"
 
     # Consume headers
     while IFS= read -r header; do

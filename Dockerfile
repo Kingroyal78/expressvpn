@@ -40,7 +40,12 @@ ENV CODE="code" \
     SOCKS_PORT="1080" \
     SOCKS_WHITELIST=""
 
+# The universal .run is multi-arch: it bundles amd64 (x64/) and arm64 (arm64/)
+# binaries and its multi_arch_installer.sh picks the right set from `uname -m`,
+# so the same URL works for every target platform of a buildx build.
+# Keep EXPRESSVPN_VERSION / EXPRESSVPN_SHA256 in sync with expressvpn.env.
 ARG EXPRESSVPN_VERSION="14.2.0.13656"
+ARG EXPRESSVPN_SHA256="9d770edc6548a17994fd15714c5030a8f5767671b76b2117a884f7d48d93f2cb"
 ARG EXPRESSVPN_RUN_URL="https://www.expressvpn.works/clients/linux/expressvpn-linux-universal-${EXPRESSVPN_VERSION}_release.run"
 COPY files/ /expressvpn/
 COPY --from=microsocks-builder /usr/local/bin/microsocks /usr/local/bin/microsocks
@@ -65,7 +70,12 @@ RUN set -eux; \
         python3 \
         python3-tomli \
         xz-utils; \
+    if [ -z "${EXPRESSVPN_SHA256}" ]; then \
+        echo "ERROR: EXPRESSVPN_SHA256 is empty; refusing to run an unverified installer as root" >&2; \
+        exit 1; \
+    fi; \
     curl -fsSL "${EXPRESSVPN_RUN_URL}" -o /tmp/expressvpn.run; \
+    echo "${EXPRESSVPN_SHA256}  /tmp/expressvpn.run" | sha256sum -c -; \
     sh /tmp/expressvpn.run --accept --quiet --noprogress -- --no-gui --sysvinit --force-dependencies; \
     rm -f /tmp/expressvpn.run; \
     curl -fsSL "https://raw.githubusercontent.com/kavehtehrani/cloudflare-speed-cli/main/install.sh" | sh; \
@@ -74,6 +84,16 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     rm -rf /var/log/*.log
 
-HEALTHCHECK --start-period=30s --timeout=10s --interval=2m --retries=3 CMD bash /expressvpn/healthcheck.sh
+# Budget: state 3s + DNS 5s + two 5s probes + 5s IP lookup + 5s hc-ping ~= 28s
+# worst case, so the timeout must exceed that or a slow check is SIGKILLed,
+# which counts as a failure *and* skips the hc-ping /fail report. Raising
+# HEALTHCHECK_TIMEOUT/HEALTHCHECK_URLS past this budget needs a matching
+# --health-timeout at run time.
+#
+# start-period must cover start.sh's worst-case boot: wait_for_daemon 120s +
+# login 60s + wait_for_smart_location 30s + wait_for_connection 30s = ~240s.
+# retries x interval then tolerates a normal supervisor reconnect (up to ~60s)
+# without flapping, while still surfacing a dead tunnel in ~2.5 minutes.
+HEALTHCHECK --start-period=300s --timeout=30s --interval=30s --retries=5 CMD bash /expressvpn/healthcheck.sh
 
 ENTRYPOINT ["/bin/bash", "/expressvpn/start.sh"]

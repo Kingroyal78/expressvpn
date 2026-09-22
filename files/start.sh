@@ -5,6 +5,7 @@ log() {
     echo "[start] $*"
 }
 
+# shellcheck disable=SC2120  # callers may pass a string or pipe into it
 trim() {
     if [[ $# -gt 0 ]]; then
         printf '%s' "$1"
@@ -107,14 +108,13 @@ set_protocol() {
 wait_for_smart_location() {
     local attempts=15
     local delay=2
-    local attempt
     local initial
     local current
 
     initial=$(expressvpnctl get smart 2>/dev/null || true)
     [[ -z "$initial" ]] && return 0
 
-    for attempt in $(seq 1 "$attempts"); do
+    for _ in $(seq 1 "$attempts"); do
         sleep "$delay"
         current=$(expressvpnctl get smart 2>/dev/null || true)
         if [[ -n "$current" && "$current" != "$initial" ]]; then
@@ -130,9 +130,8 @@ wait_for_condition() {
     local attempts="$1"
     local delay="$2"
     local check_fn="$3"
-    local attempt
 
-    for attempt in $(seq 1 "$attempts"); do
+    for _ in $(seq 1 "$attempts"); do
         if "$check_fn"; then
             return 0
         fi
@@ -216,8 +215,7 @@ apply_dns_whitelist() {
     fi
 
     local chain="xvpn_dns_ip_exceptions"
-    local attempt
-    for attempt in $(seq 1 10); do
+    for _ in $(seq 1 10); do
         if iptables -S "$chain" >/dev/null 2>&1; then
             break
         fi
@@ -416,6 +414,10 @@ supervise_connection_loop() {
     local target="${SERVER:-smart}"
     local failure_threshold="${RECONNECT_FAILURE_THRESHOLD:-3}"
     local failure_flag="/tmp/expressvpn/reconnect-failure.flag"
+    # The healthcheck drops this when it detects a fault the loop cannot see on
+    # its own - notably a tunnel that still reports Connected while traffic
+    # leaks past it - since the healthcheck itself must not reconnect.
+    local reconnect_request_flag="/tmp/expressvpn/reconnect-request.flag"
     local failure_count=0
     mkdir -p "$(dirname "${failure_flag}")"
 
@@ -435,8 +437,20 @@ supervise_connection_loop() {
 
     log "Entering supervision loop (interval ${interval}s) to keep ${target} connected."
     while true; do
-        if ! check_connected || [[ ! -d /sys/class/net/tun0 ]]; then
-            log "VPN down (missing tun0 or not connected). Attempting reconnect to ${target}..."
+        local forced_reconnect=false
+        if [[ -f "${reconnect_request_flag}" ]]; then
+            rm -f "${reconnect_request_flag}"
+            forced_reconnect=true
+            log "Reconnect requested by healthcheck; rebuilding tunnel to ${target}..."
+        fi
+
+        if [[ "${forced_reconnect}" == true ]] || ! check_connected || [[ ! -d /sys/class/net/tun0 ]]; then
+            if [[ "${forced_reconnect}" == true ]]; then
+                expressvpnctl disconnect >/dev/null 2>&1 || true
+            else
+                log "VPN down (missing tun0 or not connected)."
+            fi
+            log "Attempting reconnect to ${target}..."
             if connect_region "${target}" >/dev/null 2>&1; then
                 wait_for_connection
                 failure_count=0

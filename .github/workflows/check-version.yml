@@ -1,0 +1,101 @@
+name: Check for new ExpressVPN version
+
+# The full build number needed for the download URL is only exposed behind a
+# logged-in "My Account -> Set Up" page, so this cannot fully auto-bump. Instead
+# it watches the public release-notes page for a newer marketing version and
+# opens an issue telling you to grab the build number and run "Build and push"
+# via workflow_dispatch.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  RELEASE_NOTES_URL: https://www.expressvpn.com/support/vpn-setup/release-notes/linux-app/
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare versions and notify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./expressvpn.env
+          current="${EXPRESSVPN_VERSION%.*}"   # drop build number -> 14.2.0
+          echo "Current built marketing version: $current"
+
+          html="$(curl -fsSL -A 'Mozilla/5.0' "$RELEASE_NOTES_URL" || true)"
+          if [ -z "$html" ]; then
+            echo "::warning::Could not fetch release notes page; skipping."
+            exit 0
+          fi
+
+          # Anchor on the page's own "<date> version X.Y.Z" wording. A bare
+          # dotted-number regex also matches things like 127.0.0.1 or an inline
+          # JS version, which sort above the real releases and would wedge the
+          # check on a bogus "newest" forever.
+          # Strip everything up to the first digit so any casing of "version"
+          # is removed; a surviving letter would sort after every number under
+          # `sort -V` and silently turn this check into a no-op.
+          #
+          # Both sides are then truncated to MAJOR.MINOR.PATCH. The page also
+          # lists four-part versions, and comparing a four-part page value
+          # against the three-part `current` makes `sort -V` rank the release
+          # we already ship as newer (14.2.0.13656 > 14.2.0).
+          latest="$(printf '%s' "$html" \
+            | grep -oiE 'version[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' \
+            | sed -E 's/^[^0-9]*//' \
+            | cut -d. -f1-3 \
+            | sort -V | tail -n1 || true)"
+          if ! printf '%s' "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::warning::Could not parse a version from the release notes (got '$latest'); skipping."
+            exit 0
+          fi
+          echo "Latest published marketing version: $latest"
+
+          newest="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n1)"
+          if [ "$newest" = "$current" ]; then
+            echo "Already up to date."
+            exit 0
+          fi
+
+          title="Update ExpressVPN client to $latest"
+          if gh issue list --state open --label expressvpn-update \
+               --search "$title in:title" --json title \
+               | jq -e --arg t "$title" 'any(.[]; .title == $t)' >/dev/null; then
+            echo "Issue already open for $latest."
+            exit 0
+          fi
+
+          # Ensure the label exists (ignore error if it already does).
+          gh label create expressvpn-update --color BFD4F2 \
+            --description "New ExpressVPN client release available" 2>/dev/null || true
+
+          {
+            printf 'A newer ExpressVPN Linux client is published.\n\n'
+            printf -- '- Currently built: `%s` (marketing `%s`)\n' "$EXPRESSVPN_VERSION" "$current"
+            printf -- '- Latest published: marketing `%s`\n\n' "$latest"
+            printf 'Release notes: %s\n\n' "$RELEASE_NOTES_URL"
+            printf '**To ship it:**\n\n'
+            printf '1. Sign in to My Account -> Set Up ExpressVPN -> Linux and copy the full build number for `%s` (e.g. `%s.NNNNN`).\n' "$latest" "$latest"
+            printf '2. Download that `expressvpn-linux-universal-<build>_release.run` and run `sha256sum` on it.\n'
+            printf '3. Update `expressvpn.env` (and the `ARG` defaults in `Dockerfile`) with the new version + SHA256,\n'
+            printf '   or run the **Build and push image** workflow via *Run workflow* and paste both inputs.\n\n'
+            printf '_Opened automatically by the version-check workflow._\n'
+          } >/tmp/issue-body.md
+
+          gh issue create \
+            --title "$title" \
+            --label expressvpn-update \
+            --body-file /tmp/issue-body.md
+          echo "Opened issue: $title"
