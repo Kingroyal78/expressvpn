@@ -47,6 +47,11 @@ ENV CODE="code" \
 ARG EXPRESSVPN_VERSION="14.2.0.13656"
 ARG EXPRESSVPN_SHA256="9d770edc6548a17994fd15714c5030a8f5767671b76b2117a884f7d48d93f2cb"
 ARG EXPRESSVPN_RUN_URL="https://www.expressvpn.works/clients/linux/expressvpn-linux-universal-${EXPRESSVPN_VERSION}_release.run"
+
+LABEL org.opencontainers.image.title="ExpressVPN container" \
+      org.opencontainers.image.version="${EXPRESSVPN_VERSION}" \
+      org.opencontainers.image.description="ExpressVPN client container"
+
 COPY files/ /expressvpn/
 COPY --from=microsocks-builder /usr/local/bin/microsocks /usr/local/bin/microsocks
 

@@ -457,7 +457,8 @@ picks one at install time), so the same download builds every platform.
 ### Locally
 
 ```bash
-# Single-arch (host arch), loads into the local docker:
+# Single-arch (host arch), loads into the local docker with the pinned
+# ExpressVPN build number as the default tag:
 ./expressbuild.sh <repository> [tag]
 
 # Multi-arch build + push to a registry:
@@ -466,6 +467,8 @@ picks one at install time), so the same download builds every platform.
 
 Supported platforms: `linux/amd64` and `linux/arm64` (there is no armhf/armv7
 build). `expressbuild.sh` reads the version and checksum from `expressvpn.env`.
+When `tag` is omitted, the local image uses the full ExpressVPN build number
+(for example `14.2.0.13656`) instead of only `latest`.
 
 ### CI (GitHub Actions)
 
@@ -494,4 +497,6 @@ manual:
 
 ```bash
 docker pull ghcr.io/kingroyal78/expressvpn:latest
+# Pin deployments to a specific client build when desired:
+docker pull ghcr.io/kingroyal78/expressvpn:14.2.0.13656
 ```

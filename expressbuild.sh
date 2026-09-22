@@ -11,7 +11,7 @@ Usage: $0 <repository> [tag] [options]
 
 Arguments:
   repository            Image repository, e.g. ghcr.io/you/expressvpn or you/expressvpn
-  tag                   Image tag (default: latest)
+  tag                   Image tag (default: ExpressVPN build version)
 
 Options:
   --platform <list>     Comma-separated platforms (default: host arch)
@@ -21,7 +21,7 @@ Options:
   -h, --help            Show this help
 
 Examples:
-  $0 you/expressvpn                                    # local, host arch
+  $0 you/expressvpn                                    # local, version-tagged host arch
   $0 ghcr.io/you/expressvpn v1 --platform linux/amd64,linux/arm64 --push
 EOF
   exit 1
@@ -44,7 +44,7 @@ main() {
   : "${EXPRESSVPN_VERSION:?EXPRESSVPN_VERSION missing from expressvpn.env}"
   : "${EXPRESSVPN_SHA256:?EXPRESSVPN_SHA256 missing from expressvpn.env}"
 
-  local repository="" tag="latest" platform="" output="--load"
+  local repository="" tag="${EXPRESSVPN_VERSION}" platform="" output="--load"
   local positional=()
 
   while [[ $# -gt 0 ]]; do

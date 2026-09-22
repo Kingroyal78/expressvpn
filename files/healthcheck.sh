@@ -55,6 +55,7 @@ request_reconnect() {
 vpn_interface() {
     local iface="${HEALTHCHECK_VPN_IF:-}"
     if [[ -n $iface ]]; then
+        [[ -d "/sys/class/net/${iface}" ]] || return 0
         printf '%s' "$iface"
         return
     fi
@@ -62,7 +63,8 @@ vpn_interface() {
         printf 'tun0'
         return
     fi
-    ip -o link show 2>/dev/null | awk -F': ' '/(tun|wg)[0-9]+/ { print $2; exit }' || true
+    ip -o link show 2>/dev/null |
+        awk -F': ' '/(tun|wg)[0-9]+/ { split($2, name, "@"); print name[1]; exit }' || true
 }
 
 # Resolve the address the public IP must NOT match, and the family to compare

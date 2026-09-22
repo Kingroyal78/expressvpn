@@ -149,6 +149,21 @@ check_connected() {
     [[ "$(expressvpnctl get connectionstate 2>/dev/null || true)" == "Connected" ]]
 }
 
+vpn_interface() {
+    local iface="${HEALTHCHECK_VPN_IF:-}"
+    if [[ -n "$iface" ]]; then
+        [[ -d "/sys/class/net/${iface}" ]] || return 0
+        printf '%s' "$iface"
+        return
+    fi
+    if [[ -d /sys/class/net/tun0 ]]; then
+        printf 'tun0'
+        return
+    fi
+    ip -o link show 2>/dev/null |
+        awk -F': ' '/(tun|wg)[0-9]+/ { split($2, name, "@"); print name[1]; exit }' || true
+}
+
 region_candidates() {
     local region="$1"
     local normalized
@@ -444,11 +459,13 @@ supervise_connection_loop() {
             log "Reconnect requested by healthcheck; rebuilding tunnel to ${target}..."
         fi
 
-        if [[ "${forced_reconnect}" == true ]] || ! check_connected || [[ ! -d /sys/class/net/tun0 ]]; then
+        local iface
+        iface="$(vpn_interface)"
+        if [[ "${forced_reconnect}" == true ]] || ! check_connected || [[ -z "$iface" ]]; then
             if [[ "${forced_reconnect}" == true ]]; then
                 expressvpnctl disconnect >/dev/null 2>&1 || true
             else
-                log "VPN down (missing tun0 or not connected)."
+                log "VPN down (missing VPN interface or not connected)."
             fi
             log "Attempting reconnect to ${target}..."
             if connect_region "${target}" >/dev/null 2>&1; then
