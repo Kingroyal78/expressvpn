@@ -52,19 +52,34 @@ request_reconnect() {
     touch "$RECONNECT_REQUEST_FLAG" 2>/dev/null || true
 }
 
+interface_is_up() {
+    local iface="$1"
+    local flags
+    [[ -d "/sys/class/net/${iface}" ]] || return 1
+    flags="$(cat "/sys/class/net/${iface}/flags" 2>/dev/null)" || return 1
+    (( flags & 1 ))
+}
+
 vpn_interface() {
     local iface="${HEALTHCHECK_VPN_IF:-}"
     if [[ -n $iface ]]; then
-        [[ -d "/sys/class/net/${iface}" ]] || return 0
+        interface_is_up "$iface" || return 0
         printf '%s' "$iface"
         return
     fi
-    if [[ -d /sys/class/net/tun0 ]]; then
+    if interface_is_up tun0; then
         printf 'tun0'
         return
     fi
-    ip -o link show 2>/dev/null |
-        awk -F': ' '/(tun|wg)[0-9]+/ { split($2, name, "@"); print name[1]; exit }' || true
+
+    local candidate
+    while IFS= read -r candidate; do
+        if interface_is_up "$candidate"; then
+            printf '%s' "$candidate"
+            return
+        fi
+    done < <(ip -o link show 2>/dev/null |
+        awk -F': ' '{ split($2, name, "@"); if (name[1] ~ /^(tun|wg)/) print name[1] }')
 }
 
 # Resolve the address the public IP must NOT match, and the family to compare
